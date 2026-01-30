@@ -3,61 +3,105 @@ import struct
 import numpy as np
 from agent import DDPGAgent
 
-# --- CONFIGURACIÓN IDÉNTICA A PLECS ---
+# --- CONFIGURACIÓN ---
 HOST, PORT = "127.0.0.1", 5555
 STATE_FMT, STATE_SIZE = "<5d", struct.calcsize("<5d")
 ACT_FMT, ACT_SIZE = "<1d", struct.calcsize("<1d")
 
-# 1. Inicializamos al agente (Solo el Actor es necesario para inferencia)
+# 1. Cargar el Agente
 agent = DDPGAgent(state_dim=3, action_dim=1)
+try:
+    # Cargar los pesos entrenados
+    agent.load("buck_controller_result_finetune")
+    print("¡Cerebro cargado y listo!")
+except:
+    print("Error: No encuentro los pesos .pth")
+    exit()
 
-# 2. CARGAMOS LOS PESOS ENTRENADOS
-# Busca buck_controller_12v_actor.pth y buck_controller_12v_critic.pth
-agent.load("buck_controller_12v")
 
 def recv_exact(conn, nbytes):
     data = b""
     while len(data) < nbytes:
         chunk = conn.recv(nbytes - len(data))
-        if not chunk: raise ConnectionError("PLECS cerrado")
+        if not chunk:
+            raise ConnectionError("PLECS cerrado")
         data += chunk
     return data
 
+
 def main():
-    print(f"--- MODO INFERENCIA ACTIVADO ---")
-    print(f"Controlando Buck para V_out = 12V")
+    print(f"--- MODO INFERENCIA: ARRANQUE SUAVE + INTEGRADOR LIMPIO ---")
 
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((HOST, PORT))
             s.listen(1)
-            print(f"\n[CONTROLADOR] Esperando conexión de PLECS...")
+            print(f"\n[CONTROLADOR] Esperando a PLECS...")
             conn, addr = s.accept()
-            
+
+            step_count = 0
+
+            # VARIABLES DE CONTROL SUAVE
+            prev_u = 0.0        # Para el filtro de suavizado
+            # Nuestro integrador limpio en Python (La Solución)
+            py_integ = 0.0
+            last_time = 0.0     # Para calcular el tiempo delta (dt)
+
             try:
                 while True:
-                    # Recibir sensores de PLECS
                     pkt = recv_exact(conn, STATE_SIZE)
-                    t, e, integ, y_prev, iL = struct.unpack(STATE_FMT, pkt)
-                    
-                    # Definir estado (igual que en el entrenamiento)
-                    state = np.array([y_prev, e, iL])
+                    # Recibimos datos, pero IGNORAMOS el 'integ' que viene de PLECS
+                    t, e_plecs, integ_plecs_sucio, last_u_plecs, iL_raw = struct.unpack(
+                        STATE_FMT, pkt)
 
-                    # --- ACCIÓN PURA ---
-                    # select_action ya nos da el valor determinista sin ruido
+                    # 1. CÁLCULO DE DT (Tiempo entre pasos para integrar bien)
+                    dt = t - last_time
+                    if dt < 0:
+                        dt = 0
+                    last_time = t
+
+                    # 2. CÁLCULO DEL VOLTAJE
+                    v_out = 12.0 - e_plecs
+
+                    # 3. GESTIÓN DEL INTEGRADOR (EL TRUCO DE LA AMNESIA)
+                    # Solo empezamos a sumar error cuando el Soft Start termina (Paso 200)
+                    if step_count >= 200:
+                        py_integ += e_plecs * dt  # Integramos nosotros mismos
+                    else:
+                        py_integ = 0.0  # Mente en blanco durante el arranque
+
+                    # 4. PREPARAR ESTADO (Usando nuestro Integrador Limpio)
+                    norm_v = v_out / 12.0
+                    norm_e = e_plecs / 12.0
+                    norm_i = py_integ / 1.0  # Usamos nuestra variable limpia
+
+                    state = np.array([norm_v, norm_e, norm_i])
+
+                    # 5. DECISIÓN DE LA IA
                     action = agent.select_action(state)
-                    u = float(action[0])
+                    ai_u = float(action[0])
 
-                    # Enviar Duty Cycle a PLECS
+                    target_u = ai_u  # IA 100%
+
+                    u = 0.98 * prev_u + 0.02 * target_u
+                    prev_u = u
+
+                    # Confianza total en la red neuronal
+                    # u = target_u
+
+                    # Enviar
                     conn.sendall(struct.pack(ACT_FMT, u))
-                    
-                    # Log reducido para no saturar
-                    if int(t * 1e6) % 500 == 0: # Cada 500us
-                        print(f"T: {t:.4f} | V_out: {y_prev:.2f}V | u: {u:.3f}")
+
+                    if step_count % 100 == 0:
+                        print(
+                            f"T:{t:.4f} | Vout:{v_out:.2f}V | IA_u:{ai_u:.2f} | Final_u:{u:.3f}")
+
+                    step_count += 1
 
             except (ConnectionError, OSError):
-                print("[FIN] Simulación terminada.")
+                print("[FIN]")
+
 
 if __name__ == "__main__":
     main()
